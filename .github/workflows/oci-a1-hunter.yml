@@ -2,9 +2,7 @@ name: OCI A1 Hunter
 
 on:
   workflow_dispatch:
-
   schedule:
-    # Проверка каждые 5 минут
     - cron: "*/5 * * * *"
 
 permissions:
@@ -17,44 +15,26 @@ concurrency:
 jobs:
   hunt:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 10
 
     env:
       OCI_REGION: ${{ secrets.OCI_REGION }}
       OCI_COMPARTMENT_OCID: ${{ secrets.OCI_COMPARTMENT_OCID }}
       OCI_SUBNET_OCID: ${{ secrets.OCI_SUBNET_OCID }}
-
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-
       INSTANCE_NAME: designos-a1
       SHAPE: VM.Standard.A1.Flex
 
     steps:
-      # =========================================================
-      # INSTALL OCI CLI
-      # =========================================================
-
       - name: Install OCI CLI
         shell: bash
         run: |
           set -euo pipefail
-
           python3 -m venv "$HOME/oci-cli"
-
-          "$HOME/oci-cli/bin/pip" install \
-            --quiet \
-            --upgrade pip
-
-          "$HOME/oci-cli/bin/pip" install \
-            --quiet \
-            oci-cli
-
+          "$HOME/oci-cli/bin/pip" install --quiet --upgrade pip
+          "$HOME/oci-cli/bin/pip" install --quiet oci-cli
           echo "$HOME/oci-cli/bin" >> "$GITHUB_PATH"
-
-      # =========================================================
-      # CONFIGURE OCI
-      # =========================================================
 
       - name: Configure OCI
         shell: bash
@@ -66,13 +46,9 @@ jobs:
           OCI_SSH_PUBLIC_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
         run: |
           set -euo pipefail
+          mkdir -p "$HOME/.oci" "$HOME/.ssh"
 
-          mkdir -p "$HOME/.oci"
-          mkdir -p "$HOME/.ssh"
-
-          printf '%s\n' "$OCI_PRIVATE_KEY" \
-            > "$HOME/.oci/oci_api_key.pem"
-
+          printf '%s\n' "$OCI_PRIVATE_KEY" > "$HOME/.oci/oci_api_key.pem"
           chmod 600 "$HOME/.oci/oci_api_key.pem"
 
           cat > "$HOME/.oci/config" <<EOF
@@ -85,127 +61,70 @@ jobs:
           EOF
 
           chmod 600 "$HOME/.oci/config"
-
-          printf '%s\n' "$OCI_SSH_PUBLIC_KEY" \
-            > "$HOME/.ssh/oci_authorized_keys"
-
+          printf '%s\n' "$OCI_SSH_PUBLIC_KEY" > "$HOME/.ssh/oci_authorized_keys"
           chmod 600 "$HOME/.ssh/oci_authorized_keys"
-
-      # =========================================================
-      # TEST AUTH
-      # =========================================================
 
       - name: Test OCI authentication
         shell: bash
         run: |
           set -euo pipefail
-
-          echo "Checking OCI authentication..."
-
           oci iam region-subscription list \
             --config-file "$HOME/.oci/config" \
             >/dev/null
-
-          echo "✅ OCI authentication OK"
-
-      # =========================================================
-      # HUNT A1
-      # =========================================================
+          echo "OCI authentication OK"
 
       - name: Hunt Ampere A1
         shell: bash
         run: |
-          set -u
-          set -o pipefail
-
-          # =====================================================
-          # TELEGRAM HELPER
-          # =====================================================
+          set -uo pipefail
 
           send_telegram() {
+            local raw="$1"
+            local message
+            message="$(printf '%b' "$raw")"
 
-            MESSAGE="$1"
-
-            if [ -z "${TELEGRAM_BOT_TOKEN:-}" ]; then
-              echo "Telegram token not configured."
+            if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+              echo "Telegram secrets are not configured; notification skipped."
               return 0
             fi
 
-            if [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
-              echo "Telegram chat ID not configured."
-              return 0
-            fi
-
-            curl \
-              --silent \
-              --show-error \
-              --fail \
+            curl --silent --show-error --fail \
               -X POST \
               "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
               --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-              --data-urlencode "text=${MESSAGE}" \
-              >/dev/null \
-              || true
+              --data-urlencode "text=${message}" \
+              >/dev/null || true
           }
 
           echo "========================================"
           echo "OCI A1 HUNTER"
-          echo "========================================"
           echo "Region: $OCI_REGION"
-          echo "Shape:  $SHAPE"
-          echo
-          echo "Primary:"
-          echo "2 OCPU / 12 GB"
-          echo
-          echo "Fallback:"
-          echo "1 OCPU / 6 GB"
+          echo "Shape: $SHAPE"
+          echo "Primary: 2 OCPU / 12 GB"
+          echo "Fallback: 1 OCPU / 6 GB"
           echo "========================================"
 
-          # =====================================================
-          # CHECK EXISTING INSTANCE
-          # =====================================================
-
-          echo
-          echo "Checking existing instance..."
-
-          EXISTING=$(
+          EXISTING="$(
             oci compute instance list \
               --config-file "$HOME/.oci/config" \
               --region "$OCI_REGION" \
               --compartment-id "$OCI_COMPARTMENT_OCID" \
               --display-name "$INSTANCE_NAME" \
               --all \
-              --output json \
-              2>/dev/null |
-            jq -r '
-              .data[]
-              | select(."lifecycle-state" != "TERMINATED")
-              | .id
-            ' |
+              --output json 2>/dev/null |
+            jq -r '.data[] | select(."lifecycle-state" != "TERMINATED") | .id' |
             head -n 1
-          )
+          )"
 
           if [ -n "$EXISTING" ]; then
-
-            echo
-            echo "========================================"
-            echo "✅ A1 INSTANCE ALREADY EXISTS"
-            echo "$EXISTING"
-            echo "========================================"
-
+            echo "A1 already exists: $EXISTING"
             exit 0
           fi
 
-          # =====================================================
-          # FIND UBUNTU ARM IMAGE
-          # =====================================================
-
-          echo
           echo "Finding Ubuntu ARM image..."
+          IMAGE_FILE="$(mktemp)"
 
-          IMAGE_RESULT_FILE=$(mktemp)
-
-          if oci compute image list \
+          if ! oci compute image list \
             --config-file "$HOME/.oci/config" \
             --region "$OCI_REGION" \
             --compartment-id "$OCI_COMPARTMENT_OCID" \
@@ -215,153 +134,68 @@ jobs:
             --sort-order DESC \
             --all \
             --output json \
-            > "$IMAGE_RESULT_FILE" 2>&1
+            >"$IMAGE_FILE" 2>&1
           then
-            :
-          else
-
-            ERROR_TEXT=$(cat "$IMAGE_RESULT_FILE")
-            rm -f "$IMAGE_RESULT_FILE"
-
-            echo "❌ Failed to list Ubuntu images:"
+            ERROR_TEXT="$(cat "$IMAGE_FILE")"
+            rm -f "$IMAGE_FILE"
             echo "$ERROR_TEXT"
-
-            send_telegram "❌ OCI A1 Hunter
-
-Не удалось получить список Ubuntu ARM images.
-
-Region: $OCI_REGION
-
-Проверь OCI API / permissions."
-
+            send_telegram "❌ OCI A1 Hunter\nНе удалось получить Ubuntu ARM image.\nRegion: ${OCI_REGION}"
             exit 1
           fi
 
-          IMAGE_ID=$(
-            jq -r '
-              [
-                .data[]
-                | select(."lifecycle-state" == "AVAILABLE")
-              ][0].id // empty
-            ' \
-            "$IMAGE_RESULT_FILE"
-          )
-
-          rm -f "$IMAGE_RESULT_FILE"
+          IMAGE_ID="$(
+            jq -r '[.data[] | select(."lifecycle-state" == "AVAILABLE")][0].id // empty' "$IMAGE_FILE"
+          )"
+          rm -f "$IMAGE_FILE"
 
           if [ -z "$IMAGE_ID" ]; then
-
-            echo "❌ Compatible Ubuntu ARM image not found."
-
-            send_telegram "❌ OCI A1 Hunter
-
-Ubuntu ARM image не найден.
-
-Region: $OCI_REGION"
-
+            echo "Compatible Ubuntu ARM image not found."
+            send_telegram "❌ OCI A1 Hunter\nUbuntu ARM image не найден.\nRegion: ${OCI_REGION}"
             exit 1
           fi
 
-          echo "✅ Image found:"
-          echo "$IMAGE_ID"
+          echo "Image found: $IMAGE_ID"
 
-          # =====================================================
-          # GET AVAILABILITY DOMAINS
-          # =====================================================
-
-          echo
-          echo "Reading Availability Domains..."
-
-          AD_RESULT_FILE=$(mktemp)
-
-          if oci iam availability-domain list \
+          AD_FILE="$(mktemp)"
+          if ! oci iam availability-domain list \
             --config-file "$HOME/.oci/config" \
             --region "$OCI_REGION" \
             --compartment-id "$OCI_COMPARTMENT_OCID" \
             --output json \
-            > "$AD_RESULT_FILE" 2>&1
+            >"$AD_FILE" 2>&1
           then
-            :
-          else
-
-            ERROR_TEXT=$(cat "$AD_RESULT_FILE")
-            rm -f "$AD_RESULT_FILE"
-
-            echo "❌ Failed to read Availability Domains:"
+            ERROR_TEXT="$(cat "$AD_FILE")"
+            rm -f "$AD_FILE"
             echo "$ERROR_TEXT"
-
-            send_telegram "❌ OCI A1 Hunter
-
-Не удалось получить Availability Domains.
-
-Region: $OCI_REGION"
-
+            send_telegram "❌ OCI A1 Hunter\nНе удалось получить Availability Domains.\nRegion: ${OCI_REGION}"
             exit 1
           fi
 
-          mapfile -t ADS < <(
-            jq -r '.data[].name' "$AD_RESULT_FILE"
-          )
-
-          rm -f "$AD_RESULT_FILE"
+          mapfile -t ADS < <(jq -r '.data[].name' "$AD_FILE")
+          rm -f "$AD_FILE"
 
           if [ "${#ADS[@]}" -eq 0 ]; then
-
-            echo "❌ No Availability Domains found."
-
-            send_telegram "❌ OCI A1 Hunter
-
-Availability Domains не найдены.
-
-Region: $OCI_REGION"
-
+            echo "No Availability Domains found."
+            send_telegram "❌ OCI A1 Hunter\nAvailability Domains не найдены.\nRegion: ${OCI_REGION}"
             exit 1
           fi
 
-          echo
           echo "Availability Domains:"
+          printf '  %s\n' "${ADS[@]}"
 
-          for AD in "${ADS[@]}"; do
-            echo "  - $AD"
-          done
-
-          # =====================================================
-          # CONFIGURATIONS
-          # =====================================================
-
-          CONFIGS=(
-            "2:12"
-            "1:6"
-          )
-
-          # =====================================================
-          # TRY EVERY CONFIG + EVERY AD
-          # =====================================================
+          CONFIGS=("2:12" "1:6")
 
           for CONFIG in "${CONFIGS[@]}"; do
-
-            IFS=: read -r OCPUS MEMORY <<< "$CONFIG"
-
-            echo
-            echo "========================================"
-            echo "Trying configuration:"
-            echo "${OCPUS} OCPU / ${MEMORY} GB"
-            echo "========================================"
+            IFS=: read -r OCPUS MEMORY <<<"$CONFIG"
 
             for AD in "${ADS[@]}"; do
-
               echo
               echo "----------------------------------------"
-              echo "Trying:"
-              echo "$AD"
+              echo "Trying: $AD"
               echo "${OCPUS} OCPU / ${MEMORY} GB"
               echo "----------------------------------------"
 
-              OUTPUT_FILE=$(mktemp)
-
-              # IMPORTANT:
-              # Run inside IF so GitHub Bash -e does NOT kill
-              # the whole workflow when OCI returns exit code 1.
+              OUTPUT_FILE="$(mktemp)"
 
               if oci compute instance launch \
                 --config-file "$HOME/.oci/config" \
@@ -380,279 +214,83 @@ Region: $OCI_REGION"
                 --wait-interval-seconds 15 \
                 --no-retry \
                 --output json \
-                > "$OUTPUT_FILE" 2>&1
+                >"$OUTPUT_FILE" 2>&1
               then
                 EXIT_CODE=0
               else
                 EXIT_CODE=$?
               fi
 
-              # =================================================
-              # SUCCESS
-              # =================================================
-
               if [ "$EXIT_CODE" -eq 0 ]; then
-
-                INSTANCE_ID=$(
-                  jq -r '.data.id // empty' \
-                    "$OUTPUT_FILE" \
-                    2>/dev/null
-                )
-
+                INSTANCE_ID="$(jq -r '.data.id // empty' "$OUTPUT_FILE" 2>/dev/null)"
                 rm -f "$OUTPUT_FILE"
 
-                echo
-                echo "========================================"
-                echo "🔥🔥🔥 A1 FOUND AND CREATED 🔥🔥🔥"
-                echo "========================================"
-                echo
-                echo "Availability Domain:"
-                echo "$AD"
-                echo
-                echo "Configuration:"
-                echo "${OCPUS} OCPU / ${MEMORY} GB"
-                echo
-                echo "Instance ID:"
-                echo "$INSTANCE_ID"
-                echo
-
-                # ================================================
-                # GET PUBLIC IP
-                # ================================================
-
                 PUBLIC_IP="unknown"
-
                 sleep 5
-
-                VNIC_OUTPUT=$(mktemp)
+                VNIC_FILE="$(mktemp)"
 
                 if oci compute instance list-vnics \
                   --config-file "$HOME/.oci/config" \
                   --region "$OCI_REGION" \
                   --instance-id "$INSTANCE_ID" \
                   --output json \
-                  > "$VNIC_OUTPUT" 2>/dev/null
+                  >"$VNIC_FILE" 2>/dev/null
                 then
-
-                  PUBLIC_IP=$(
-                    jq -r '
-                      .data[0]."public-ip"
-                      // "unknown"
-                    ' \
-                    "$VNIC_OUTPUT"
-                  )
+                  PUBLIC_IP="$(jq -r '.data[0]."public-ip" // "unknown"' "$VNIC_FILE")"
                 fi
+                rm -f "$VNIC_FILE"
 
-                rm -f "$VNIC_OUTPUT"
-
-                echo "Public IP:"
-                echo "$PUBLIC_IP"
-
-                echo
                 echo "========================================"
-                echo "✅ SUCCESS"
+                echo "A1 FOUND AND CREATED"
+                echo "AD: $AD"
+                echo "CPU: $OCPUS OCPU"
+                echo "RAM: $MEMORY GB"
+                echo "Public IP: $PUBLIC_IP"
+                echo "Instance: $INSTANCE_ID"
                 echo "========================================"
 
-                send_telegram "🔥 ORACLE A1 ПОЙМАН!
-
-🖥 DesignOS Server
-
-📍 Region:
-$OCI_REGION
-
-🏢 Availability Domain:
-$AD
-
-⚙️ CPU:
-$OCPUS OCPU
-
-🧠 RAM:
-$MEMORY GB
-
-🌐 Public IP:
-$PUBLIC_IP
-
-✅ Instance создан автоматически.
-
-A1 Hunter больше не создаст второй экземпляр с именем $INSTANCE_NAME."
-
+                send_telegram "🔥 ORACLE A1 ПОЙМАН!\n\n🖥 DesignOS Server\n📍 Region: ${OCI_REGION}\n🏢 AD: ${AD}\n⚙️ CPU: ${OCPUS} OCPU\n🧠 RAM: ${MEMORY} GB\n🌐 Public IP: ${PUBLIC_IP}\n\n✅ Instance создан автоматически."
                 exit 0
               fi
 
-              # =================================================
-              # READ ERROR
-              # =================================================
-
-              ERROR_TEXT=$(cat "$OUTPUT_FILE")
+              ERROR_TEXT="$(cat "$OUTPUT_FILE")"
               rm -f "$OUTPUT_FILE"
 
-              echo
               echo "OCI response:"
               echo "$ERROR_TEXT" | tail -n 30
 
-              # =================================================
-              # NO CAPACITY
-              # =================================================
-
-              if echo "$ERROR_TEXT" |
-                grep -Eqi \
-                "Out of host capacity|OutOfHostCapacity|out of capacity|InsufficientHostCapacity"
-              then
-
-                echo
-                echo "⚪ No capacity in:"
-                echo "$AD"
-
+              if echo "$ERROR_TEXT" | grep -Eqi 'Out of host capacity|OutOfHostCapacity|out of capacity|InsufficientHostCapacity'; then
+                echo "No capacity in $AD"
                 continue
               fi
 
-              # =================================================
-              # SERVICE / QUOTA LIMIT
-              # =================================================
-
-              if echo "$ERROR_TEXT" |
-                grep -Eqi \
-                "LimitExceeded|QuotaExceeded|ServiceLimit|service limit"
-              then
-
-                echo
-                echo "❌ OCI SERVICE / QUOTA LIMIT"
-
-                send_telegram "⚠️ OCI A1 Hunter
-
-Обнаружен Service / Quota Limit.
-
-Region:
-$OCI_REGION
-
-Configuration:
-$OCPUS OCPU / $MEMORY GB
-
-AD:
-$AD
-
-Проверь Oracle limits."
-
+              if echo "$ERROR_TEXT" | grep -Eqi 'LimitExceeded|QuotaExceeded|ServiceLimit|service limit'; then
+                send_telegram "⚠️ OCI A1 Hunter\nService / Quota Limit.\nRegion: ${OCI_REGION}\nAD: ${AD}\nConfig: ${OCPUS} OCPU / ${MEMORY} GB"
                 exit 1
               fi
 
-              # =================================================
-              # AUTH ERROR
-              # =================================================
-
-              if echo "$ERROR_TEXT" |
-                grep -Eqi \
-                "NotAuthenticated|InvalidKey|InvalidPrivateKey|InvalidFingerprint"
-              then
-
-                echo
-                echo "❌ OCI AUTHENTICATION ERROR"
-
-                send_telegram "❌ OCI A1 Hunter
-
-Ошибка OCI API authentication.
-
-Проверь:
-User OCID
-Tenancy OCID
-Fingerprint
-Private API Key"
-
+              if echo "$ERROR_TEXT" | grep -Eqi 'NotAuthenticated|InvalidKey|InvalidPrivateKey|InvalidFingerprint'; then
+                send_telegram "❌ OCI A1 Hunter\nОшибка API authentication.\nПроверь User OCID, Tenancy OCID, Fingerprint и Private API Key."
                 exit 1
               fi
 
-              # =================================================
-              # PERMISSION ERROR
-              # =================================================
-
-              if echo "$ERROR_TEXT" |
-                grep -Eqi \
-                "NotAuthorized|Authorization failed|Forbidden"
-              then
-
-                echo
-                echo "❌ OCI PERMISSION ERROR"
-
-                send_telegram "❌ OCI A1 Hunter
-
-Недостаточно прав OCI.
-
-Region:
-$OCI_REGION
-
-Проверь IAM permissions / API key."
-
+              if echo "$ERROR_TEXT" | grep -Eqi 'NotAuthorized|Authorization failed|Forbidden'; then
+                send_telegram "❌ OCI A1 Hunter\nНедостаточно прав OCI.\nПроверь IAM permissions."
                 exit 1
               fi
 
-              # =================================================
-              # INVALID CONFIG
-              # =================================================
-
-              if echo "$ERROR_TEXT" |
-                grep -Eqi \
-                "InvalidParameter|InvalidSubnet|NotFound|InvalidImage"
-              then
-
-                echo
-                echo "❌ OCI CONFIGURATION ERROR"
-
-                send_telegram "❌ OCI A1 Hunter
-
-Ошибка конфигурации OCI.
-
-Проверь:
-Subnet OCID
-Compartment OCID
-Region
-Ubuntu Image
-
-AD:
-$AD"
-
+              if echo "$ERROR_TEXT" | grep -Eqi 'InvalidParameter|InvalidSubnet|NotFound|InvalidImage'; then
+                send_telegram "❌ OCI A1 Hunter\nОшибка конфигурации OCI.\nAD: ${AD}\nПроверь Subnet, Compartment, Region и Image."
                 exit 1
               fi
 
-              # =================================================
-              # OTHER ERROR
-              # =================================================
-
-              echo
-              echo "⚠️ Other OCI error."
-              echo "Trying next AD/configuration..."
-
-              # Не останавливаем всю охоту на временной
-              # неизвестной ошибке одного AD.
-
-              continue
-
+              echo "Unknown or temporary OCI error; trying next AD."
             done
           done
 
-          # =====================================================
-          # NOTHING FOUND
-          # =====================================================
-
-          echo
           echo "========================================"
-          echo "⚪ NO A1 CAPACITY RIGHT NOW"
-          echo "========================================"
-          echo
-          echo "Checked:"
-          echo
-          echo "2 OCPU / 12 GB"
-          echo "  - AD-1"
-          echo "  - AD-2"
-          echo "  - AD-3"
-          echo
-          echo "1 OCPU / 6 GB"
-          echo "  - AD-1"
-          echo "  - AD-2"
-          echo "  - AD-3"
-          echo
+          echo "NO A1 CAPACITY RIGHT NOW"
+          echo "Checked all ADs for 2 OCPU / 12 GB and 1 OCPU / 6 GB."
           echo "GitHub will retry automatically."
-          echo
-          echo "No Telegram message sent."
           echo "========================================"
-
           exit 0
